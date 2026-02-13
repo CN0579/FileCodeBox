@@ -17,6 +17,7 @@ from apps.admin.views import admin_api
 from apps.base.models import KeyValue
 from apps.base.utils import ip_limit
 from apps.base.views import share_api, chunk_api, presign_api
+from core.config import ensure_settings_row, refresh_settings
 from core.database import db_startup_lock, get_db_config, init_db
 from core.logger import logger
 from core.response import APIResponse
@@ -58,13 +59,11 @@ async def lifespan(app: FastAPI):
 
 
 async def load_config():
-    user_config, _ = await KeyValue.get_or_create(
-        key="settings", defaults={"value": DEFAULT_CONFIG}
-    )
+    await ensure_settings_row()
     await KeyValue.update_or_create(
         key="sys_start", defaults={"value": int(time.time() * 1000)}
     )
-    settings.user_config = user_config.value
+    await refresh_settings()
 
     await migrate_password_to_hash()
 
@@ -86,6 +85,11 @@ async def migrate_password_to_hash():
 
 
 app = FastAPI(lifespan=lifespan)
+
+@app.middleware("http")
+async def refresh_settings_middleware(request, call_next):
+    await refresh_settings()
+    return await call_next(request)
 
 app.add_middleware(
     CORSMiddleware,
