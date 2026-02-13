@@ -1,6 +1,9 @@
+import asyncio
 import glob
 import importlib
 import os
+from contextlib import asynccontextmanager
+from typing import IO
 
 from tortoise import Tortoise
 
@@ -8,29 +11,91 @@ from core.logger import logger
 from core.settings import data_root
 
 
+_DB_FILE = os.path.join(data_root, "filecodebox.db")
+_STARTUP_LOCK_FILE = os.path.join(data_root, "filecodebox.startup.lock")
+
+
+def get_db_config() -> dict:
+    return {
+        "connections": {
+            "default": {
+                "engine": "tortoise.backends.sqlite",
+                "credentials": {
+                    "file_path": _DB_FILE,
+                    "journal_mode": "WAL",
+                    "busy_timeout": 10000,
+                    "foreign_keys": "ON",
+                },
+            }
+        },
+        "apps": {
+            "models": {
+                "models": ["apps.base.models"],
+                "default_connection": "default",
+            }
+        },
+        "use_tz": False,
+        "timezone": "Asia/Shanghai",
+    }
+
+
+def _lock_file(file_obj: IO[str]) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        # Windows 需要锁定至少 1 字节
+        if os.fstat(file_obj.fileno()).st_size == 0:
+            file_obj.write("0")
+            file_obj.flush()
+        msvcrt.locking(file_obj.fileno(), msvcrt.LK_LOCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(file_obj.fileno(), fcntl.LOCK_EX)
+
+
+def _unlock_file(file_obj: IO[str]) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(file_obj.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(file_obj.fileno(), fcntl.LOCK_UN)
+
+
+@asynccontextmanager
+async def db_startup_lock():
+    os.makedirs(data_root, exist_ok=True)
+    lock_file = open(_STARTUP_LOCK_FILE, "a+", encoding="utf-8")
+    try:
+        await asyncio.to_thread(_lock_file, lock_file)
+        yield
+    finally:
+        await asyncio.to_thread(_unlock_file, lock_file)
+        lock_file.close()
+
+
 async def init_db():
     try:
-        # 使用正确的Tortoise初始化配置格式
-        db_config = {
-            "db_url": f"sqlite://{data_root}/filecodebox.db",
-            "modules": {"models": ["apps.base.models"]},
-            "use_tz": False,
-            "timezone": "Asia/Shanghai"
-        }
+        db_config = get_db_config()
 
-        await Tortoise.init(**db_config)
+        if not Tortoise._inited:
+            await Tortoise.init(config=db_config)
 
-        # 创建migrations表
-        await Tortoise.get_connection("default").execute_script("""
-            CREATE TABLE IF NOT EXISTS migrates (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                migration_file VARCHAR(255) NOT NULL UNIQUE,
-                executed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+        async with db_startup_lock():
+            # 创建migrations表
+            await Tortoise.get_connection("default").execute_script("""
+                CREATE TABLE IF NOT EXISTS migrates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    migration_file VARCHAR(255) NOT NULL UNIQUE,
+                    executed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
 
-        # 执行迁移
-        await execute_migrations()
+            # 执行迁移
+            await execute_migrations()
 
     except Exception as e:
         logger.error(f"数据库初始化失败: {str(e)}")

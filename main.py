@@ -17,10 +17,10 @@ from apps.admin.views import admin_api
 from apps.base.models import KeyValue
 from apps.base.utils import ip_limit
 from apps.base.views import share_api, chunk_api, presign_api
-from core.database import init_db
+from core.database import db_startup_lock, get_db_config, init_db
 from core.logger import logger
 from core.response import APIResponse
-from core.settings import data_root, settings, BASE_DIR, DEFAULT_CONFIG
+from core.settings import settings, BASE_DIR, DEFAULT_CONFIG
 from core.tasks import delete_expire_files, clean_incomplete_uploads
 from core.utils import hash_password, is_password_hashed
 
@@ -31,8 +31,9 @@ async def lifespan(app: FastAPI):
     # 初始化数据库
     await init_db()
 
-    # 加载配置
-    await load_config()
+    # 加载配置（多进程下串行化启动写操作）
+    async with db_startup_lock():
+        await load_config()
     app.mount(
         "/assets",
         StaticFiles(directory=f"./{settings.themesSelect}/assets"),
@@ -97,15 +98,7 @@ app.add_middleware(
 # 使用 register_tortoise 来添加异常处理器
 register_tortoise(
     app,
-    config={
-        "connections": {"default": f"sqlite://{data_root}/filecodebox.db"},
-        "apps": {
-            "models": {
-                "models": ["apps.base.models"],
-                "default_connection": "default",
-            },
-        },
-    },
+    config=get_db_config(),
     generate_schemas=False,
     add_exception_handlers=True,
 )
